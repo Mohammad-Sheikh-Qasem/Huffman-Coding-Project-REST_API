@@ -1,0 +1,7 @@
+the quick brown fox jumps over the lazy dog, the lazy dog barks at the quick brown fox
+data structures are fundamental to computer science and software engineering
+huffman coding is a lossless data compression algorithm that uses variable length codes
+the more frequent a character appears, the shorter its binary code will be
+this allows text files to be compressed significantly without losing any information
+algorithms and data structures form the backbone of efficient software systems
+trees queues stacks arrays and linked lists are essential data structures to master
