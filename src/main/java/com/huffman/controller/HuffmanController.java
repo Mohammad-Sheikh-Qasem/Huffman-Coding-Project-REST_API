@@ -115,7 +115,7 @@ public class HuffmanController{
         }
     }
 
-    /** POST /api/huffman/compress/download — returns a self-contained .huf file */
+    /** POST /api/huffman/compress/download — returns a self-contained .huf file (true binary) */
     @PostMapping(value = "/compress/download", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> compressDownload(
             @RequestParam("file") MultipartFile file,
@@ -136,7 +136,7 @@ public class HuffmanController{
                 return ResponseEntity.badRequest().body(errorBody("The uploaded file is empty"));
             }
 
-            // Build tree and compress (extended when k > 1)
+            // Build tree and compress
             Map<Character, Integer> frequencies = frequencyService.analyse(text);
             HuffmanNode root = (k == 1)
                     ? treeService.buildTree(frequencies)
@@ -144,10 +144,51 @@ public class HuffmanController{
             Map<Character, String> codes = treeService.generateCodes(root);
             int[] compressedData = compressionService.compress(text, codes);
 
-            // Serialize to .huf JSON
             String originalFilename = file.getOriginalFilename();
-            byte[] hufBytes = objectMapper.writerWithDefaultPrettyPrinter()
-                    .writeValueAsBytes(buildHufPayload(originalFilename, frequencies, compressedData, k));
+
+            // ── Serialize to TRUE BINARY .huf format ──────────────────────────
+            // Format (little-endian):
+            //  [4 bytes] magic "HUF\0"
+            //  [1 byte ] k value
+            //  [1 byte ] padBits (stored in compressedData[0])
+            //  [2 bytes] number of distinct characters (freq table size)
+            //  for each entry: [1 byte char_index][4 bytes frequency]
+            //  [4 bytes] data length (number of data ints = compressedData.length - 1)
+            //  [N bytes] packed data bytes (compressedData[1..n], each as 1 byte)
+            //  [1 byte ] filename length
+            //  [M bytes] original filename bytes (UTF-8)
+            // ──────────────────────────────────────────────────────────────────
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            java.io.DataOutputStream dos = new java.io.DataOutputStream(baos);
+
+            // Magic header
+            dos.write(new byte[]{'H','U','F',0});
+
+            // k and padBits
+            dos.writeByte(k);
+            dos.writeByte(compressedData[0]); // padBits
+
+            // Frequency table
+            dos.writeShort(frequencies.size());
+            for (Map.Entry<Character, Integer> entry : frequencies.entrySet()) {
+                dos.writeByte((int) entry.getKey()); // char as byte (all chars fit in 0-127 + space/comma)
+                dos.writeInt(entry.getValue());
+            }
+
+            // Compressed data (skip index 0 = padBits header)
+            int dataLen = compressedData.length - 1;
+            dos.writeInt(dataLen);
+            for (int i = 1; i <= dataLen; i++) {
+                dos.writeByte(compressedData[i]); // each value is 0-255, safe as byte
+            }
+
+            // Original filename
+            byte[] nameBytes = (originalFilename != null ? originalFilename : "").getBytes(StandardCharsets.UTF_8);
+            dos.writeByte(nameBytes.length);
+            dos.write(nameBytes);
+
+            dos.flush();
+            byte[] hufBytes = baos.toByteArray();
 
             String hufFilename = (originalFilename != null && originalFilename.contains("."))
                     ? originalFilename.substring(0, originalFilename.lastIndexOf('.')) + ".huf"
@@ -167,7 +208,7 @@ public class HuffmanController{
         }
     }
 
-    /** POST /api/huffman/decompress/download — accepts a .huf file, returns the original .txt */
+    /** POST /api/huffman/decompress/download — accepts a binary .huf file, returns the original .txt */
     @PostMapping(value = "/decompress/download", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> decompressDownload(@RequestParam("file") MultipartFile file){
 
@@ -180,35 +221,45 @@ public class HuffmanController{
                 return ResponseEntity.badRequest().body(errorBody("Only .huf files are accepted. Received: " + filename));
             }
 
-            // Parse the .huf JSON payload
-            @SuppressWarnings("unchecked")
-            Map<String, Object> payload = objectMapper.readValue(file.getBytes(), Map.class);
+            // ── Read binary .huf format ────────────────────────────────────────
+            java.io.DataInputStream dis = new java.io.DataInputStream(
+                    new java.io.ByteArrayInputStream(file.getBytes()));
 
-            String originalFilename = (String) payload.get("originalFilename");
-            int padBits = ((Number) payload.get("padBits")).intValue();
-            int k = payload.containsKey("k") ? ((Number) payload.get("k")).intValue() : 1;
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> freqStrKeys = (Map<String, Object>) payload.get("frequencies");
-
-            @SuppressWarnings("unchecked")
-            List<Integer> dataList = (List<Integer>) payload.get("data");
-
-            // Convert string keys back to characters
-            Map<Character, Integer> frequencies = new LinkedHashMap<>();
-            freqStrKeys.forEach((key, v) -> {
-                char ch = "SPACE".equals(key) ? ' ' : "COMMA".equals(key) ? ',' : key.charAt(0);
-                frequencies.put(ch, ((Number) v).intValue());
-            });
-
-            // Reconstruct int[] = [padBits, data...]
-            int[] compressedData = new int[1 + dataList.size()];
-            compressedData[0] = padBits;
-            for (int i = 0; i < dataList.size(); i++){
-                compressedData[i + 1] = dataList.get(i);
+            // Magic header check
+            byte[] magic = new byte[4];
+            dis.readFully(magic);
+            if (magic[0] != 'H' || magic[1] != 'U' || magic[2] != 'F' || magic[3] != 0) {
+                return ResponseEntity.badRequest().body(errorBody("Invalid .huf file format (bad magic header)"));
             }
 
-            // Rebuild the exact same tree that was used during compression
+            int k       = dis.readUnsignedByte();
+            int padBits = dis.readUnsignedByte();
+
+            // Frequency table
+            int freqCount = dis.readUnsignedShort();
+            Map<Character, Integer> frequencies = new LinkedHashMap<>();
+            for (int i = 0; i < freqCount; i++) {
+                char ch   = (char) dis.readUnsignedByte();
+                int  freq = dis.readInt();
+                frequencies.put(ch, freq);
+            }
+
+            // Compressed data
+            int dataLen = dis.readInt();
+            int[] compressedData = new int[1 + dataLen];
+            compressedData[0] = padBits;
+            for (int i = 1; i <= dataLen; i++) {
+                compressedData[i] = dis.readUnsignedByte(); // 0-255
+            }
+
+            // Original filename
+            int nameLen = dis.readUnsignedByte();
+            byte[] nameBytes = new byte[nameLen];
+            if (nameLen > 0) dis.readFully(nameBytes);
+            String originalFilename = new String(nameBytes, StandardCharsets.UTF_8);
+            // ──────────────────────────────────────────────────────────────────
+
+            // Rebuild tree and decompress
             HuffmanNode root = (k == 1)
                     ? treeService.buildTree(frequencies)
                     : treeService.buildTreeExtended(frequencies, k, new ArrayList<>());
@@ -383,33 +434,6 @@ public class HuffmanController{
         }
     }
 
-
-    /** Builds the Map that gets serialized as the .huf JSON file. */
-    private Map<String, Object> buildHufPayload(String originalFilename,
-                                                Map<Character, Integer> frequencies,
-                                                int[] compressedData,
-                                                int k){
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("originalFilename", originalFilename);
-        payload.put("k", k);
-
-        // Convert char keys to string labels (SPACE / COMMA / char)
-        Map<String, Integer> freqStr = new LinkedHashMap<>();
-        frequencies.forEach((ch, freq) -> {
-            String label = (ch == ' ') ? "SPACE" : (ch == ',') ? "COMMA" : String.valueOf(ch);
-            freqStr.put(label, freq);
-        });
-        payload.put("frequencies", freqStr);
-
-        // Split padBits (index 0) from the actual data (index 1..n)
-        payload.put("padBits", compressedData[0]);
-        List<Integer> dataList = new ArrayList<>(compressedData.length - 1);
-        for (int i = 1; i < compressedData.length; i++){
-            dataList.add(compressedData[i]);
-        }
-        payload.put("data", dataList);
-        return payload;
-    }
 
     private String validateFile(MultipartFile file){
 
